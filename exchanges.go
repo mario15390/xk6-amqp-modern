@@ -1,3 +1,16 @@
+// exchanges.go — Exchange operations for the xk6-amqp extension.
+//
+// Exchanges are the routing hubs in AMQP. Producers publish messages
+// to exchanges, which then route them to queues based on bindings
+// and routing keys.
+//
+// Exchange types supported by RabbitMQ:
+//   - "direct":  routes to queues whose binding key exactly matches the routing key
+//   - "fanout":  routes to all bound queues (ignores routing key)
+//   - "topic":   routes based on wildcard pattern matching (* and #)
+//   - "headers": routes based on message header attributes
+//
+// All methods are on ModuleInstance (per-VU, no shared state).
 package amqp
 
 import (
@@ -6,86 +19,98 @@ import (
 	amqpDriver "github.com/rabbitmq/amqp091-go"
 )
 
-// Exchange defines a connection to publish/subscribe destinations.
-type Exchange struct {
-	Version     string
-	Connections *map[int]*amqpDriver.Connection
-	MaxConnID   *int
+// ---------------------------------------------------------------------------
+// Exchange Option Types
+// ---------------------------------------------------------------------------
+
+// DeclareExchangeOptions provides parameters when declaring (creating) an exchange.
+type DeclareExchangeOptions struct {
+	// Name is the exchange name.
+	Name string `js:"name"`
+
+	// Kind is the exchange type: "direct", "fanout", "topic", or "headers".
+	Kind string `js:"kind"`
+
+	// Durable exchanges survive broker restarts.
+	Durable bool `js:"durable"`
+
+	// AutoDelete: if true, the exchange is deleted when the last queue
+	// bound to it is unbound.
+	AutoDelete bool `js:"auto_delete"`
+
+	// Internal exchanges cannot be published to directly by clients;
+	// they can only receive messages from other exchanges via bindings.
+	Internal bool `js:"internal"`
+
+	// NoWait: if true, do not wait for server confirmation.
+	NoWait bool `js:"no_wait"`
+
+	// Args are optional arguments for the exchange.
+	Args amqpDriver.Table `js:"args"`
 }
 
-// ExchangeOptions defines configuration settings for accessing an exchange.
-type ExchangeOptions struct {
-	ConnectionURL string
-}
-
-// ExchangeDeclareOptions provides options when declaring (creating) an exchange.
-type ExchangeDeclareOptions struct {
-	ConnectionID int
-	Name         string
-	Kind         string
-	Durable      bool
-	AutoDelete   bool
-	Internal     bool
-	NoWait       bool
-	Args         amqpDriver.Table
-}
-
-// ExchangeDeleteOptions provides options when deleting an exchange.
-type ExchangeDeleteOptions struct {
-	ConnectionID int
-}
-
-// ExchangeBindOptions provides options when binding (subscribing) one exchange to another.
+// ExchangeBindOptions provides parameters when binding one exchange to another.
+// This creates a routing link: messages published to the source exchange
+// are also routed to the destination exchange.
 type ExchangeBindOptions struct {
-	ConnectionID            int
-	DestinationExchangeName string
-	SourceExchangeName      string
-	RoutingKey              string
-	NoWait                  bool
-	Args                    amqpDriver.Table
+	// DestinationExchangeName receives routed messages.
+	DestinationExchangeName string `js:"destination_exchange_name"`
+
+	// SourceExchangeName is where messages originate.
+	SourceExchangeName string `js:"source_exchange_name"`
+
+	// RoutingKey is the routing pattern for the binding.
+	RoutingKey string `js:"routing_key"`
+
+	// NoWait: if true, do not wait for server confirmation.
+	NoWait bool `js:"no_wait"`
+
+	// Args are optional arguments for the binding.
+	Args amqpDriver.Table `js:"args"`
 }
 
-// ExchangeUnbindOptions provides options when unbinding (unsubscribing) one exchange from another.
+// ExchangeUnbindOptions provides parameters when removing an exchange-to-exchange binding.
 type ExchangeUnbindOptions struct {
-	ConnectionID            int
-	DestinationExchangeName string
-	SourceExchangeName      string
-	RoutingKey              string
-	NoWait                  bool
-	Args                    amqpDriver.Table
+	// DestinationExchangeName is the exchange that was receiving messages.
+	DestinationExchangeName string `js:"destination_exchange_name"`
+
+	// SourceExchangeName is the exchange that was sending messages.
+	SourceExchangeName string `js:"source_exchange_name"`
+
+	// RoutingKey must match the routing key used when the binding was created.
+	RoutingKey string `js:"routing_key"`
+
+	// NoWait: if true, do not wait for server confirmation.
+	NoWait bool `js:"no_wait"`
+
+	// Args must match the args used when the binding was created.
+	Args amqpDriver.Table `js:"args"`
 }
 
-// GetConn gets an initialised connection by ID, or returns the last initialised one if ID is 0
-func (exchange *Exchange) GetConn(connID int) (*amqpDriver.Connection, error) {
-	if connID == 0 {
-		conn := (*exchange.Connections)[*exchange.MaxConnID]
-		if conn == nil {
-			return &amqpDriver.Connection{}, fmt.Errorf("connection not initialised")
-		}
-		return conn, nil
-	}
+// ---------------------------------------------------------------------------
+// Exchange Methods (on ModuleInstance)
+// ---------------------------------------------------------------------------
 
-	conn := (*exchange.Connections)[connID]
-	if conn == nil {
-		return &amqpDriver.Connection{}, fmt.Errorf("connection with ID %d not initialised", connID)
-	}
-	return conn, nil
-}
-
-// Declare creates a new exchange given the provided options.
-func (exchange *Exchange) Declare(options ExchangeDeclareOptions) error {
-	conn, err := exchange.GetConn(options.ConnectionID)
-	if err != nil {
-		return err
-	}
-	ch, err := conn.Channel()
+// DeclareExchange creates or verifies an exchange on the AMQP server.
+// If the exchange already exists with identical properties, this is a no-op.
+//
+// JavaScript usage:
+//
+//	declareExchange({
+//	    name: "my-exchange",
+//	    kind: "topic",
+//	    durable: true,
+//	});
+func (mi *ModuleInstance) DeclareExchange(options DeclareExchangeOptions) error {
+	ch, err := mi.getChannel()
 	if err != nil {
 		return err
 	}
 	defer func() {
 		_ = ch.Close()
 	}()
-	return ch.ExchangeDeclare(
+
+	err = ch.ExchangeDeclare(
 		options.Name,
 		options.Kind,
 		options.Durable,
@@ -94,68 +119,101 @@ func (exchange *Exchange) Declare(options ExchangeDeclareOptions) error {
 		options.NoWait,
 		options.Args,
 	)
+	if err != nil {
+		return fmt.Errorf("amqp: failed to declare exchange %q (kind=%s): %w",
+			options.Name, options.Kind, err)
+	}
+	return nil
 }
 
-// Delete removes an exchange from the remote server given the exchange name.
-func (exchange *Exchange) Delete(name string, options ExchangeDeleteOptions) error {
-	conn, err := exchange.GetConn(options.ConnectionID)
-	if err != nil {
-		return err
-	}
-	ch, err := conn.Channel()
+// DeleteExchange removes an exchange from the AMQP server.
+// Any existing bindings to the exchange are also removed.
+//
+// JavaScript usage:
+//
+//	deleteExchange("my-exchange");
+func (mi *ModuleInstance) DeleteExchange(name string) error {
+	ch, err := mi.getChannel()
 	if err != nil {
 		return err
 	}
 	defer func() {
 		_ = ch.Close()
 	}()
-	return ch.ExchangeDelete(
+
+	err = ch.ExchangeDelete(
 		name,
-		false, // ifUnused
+		false, // ifUnused — delete even if queues are bound
 		false, // noWait
 	)
+	if err != nil {
+		return fmt.Errorf("amqp: failed to delete exchange %q: %w", name, err)
+	}
+	return nil
 }
 
-// Bind subscribes one exchange to another.
-func (exchange *Exchange) Bind(options ExchangeBindOptions) error {
-	conn, err := exchange.GetConn(options.ConnectionID)
-	if err != nil {
-		return err
-	}
-	ch, err := conn.Channel()
+// BindExchange creates a routing link from one exchange (source) to
+// another (destination). Messages published to the source that match
+// the routing key will also be delivered to the destination.
+//
+// JavaScript usage:
+//
+//	bindExchange({
+//	    source_exchange_name: "source-exchange",
+//	    destination_exchange_name: "dest-exchange",
+//	    routing_key: "events.*",
+//	});
+func (mi *ModuleInstance) BindExchange(options ExchangeBindOptions) error {
+	ch, err := mi.getChannel()
 	if err != nil {
 		return err
 	}
 	defer func() {
 		_ = ch.Close()
 	}()
-	return ch.ExchangeBind(
+
+	err = ch.ExchangeBind(
 		options.DestinationExchangeName,
 		options.RoutingKey,
 		options.SourceExchangeName,
 		options.NoWait,
 		options.Args,
 	)
+	if err != nil {
+		return fmt.Errorf("amqp: failed to bind exchange %q to %q: %w",
+			options.SourceExchangeName, options.DestinationExchangeName, err)
+	}
+	return nil
 }
 
-// Unbind removes a subscription from one exchange to another.
-func (exchange *Exchange) Unbind(options ExchangeUnbindOptions) error {
-	conn, err := exchange.GetConn(options.ConnectionID)
-	if err != nil {
-		return err
-	}
-	ch, err := conn.Channel()
+// UnbindExchange removes a routing link between two exchanges.
+//
+// JavaScript usage:
+//
+//	unbindExchange({
+//	    source_exchange_name: "source-exchange",
+//	    destination_exchange_name: "dest-exchange",
+//	    routing_key: "events.*",
+//	});
+func (mi *ModuleInstance) UnbindExchange(options ExchangeUnbindOptions) error {
+	ch, err := mi.getChannel()
 	if err != nil {
 		return err
 	}
 	defer func() {
 		_ = ch.Close()
 	}()
-	return ch.ExchangeUnbind(
+
+	err = ch.ExchangeUnbind(
 		options.DestinationExchangeName,
 		options.RoutingKey,
 		options.SourceExchangeName,
 		options.NoWait,
 		options.Args,
 	)
+	if err != nil {
+		return fmt.Errorf("amqp: failed to unbind exchange %q from %q: %w",
+			options.SourceExchangeName, options.DestinationExchangeName, err)
+	}
+	return nil
 }

@@ -1,0 +1,35 @@
+# Dockerfile.test — Container for running Go unit and integration tests
+#
+# This container has the full Go toolchain and is used for:
+#   - Unit tests:       go test -v -race -cover ./...
+#   - Integration tests: go test -v -tags=integration ./integration/...
+#
+# Build:
+#   docker compose build unit-tests
+#
+# Run unit tests:
+#   docker compose run --rm unit-tests
+#
+# Run integration tests:
+#   docker compose run --rm integration-tests
+
+FROM golang:1.25-alpine
+
+# Install git (needed for go mod download) and build-base (gcc, musl-dev)
+# which are required for CGO_ENABLED=1 (needed by -race detector)
+RUN apk add --no-cache git build-base
+
+# Enable CGO for the race detector
+ENV CGO_ENABLED=1
+
+WORKDIR /src
+
+# Download dependencies first (Docker layer caching optimization)
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy all source code
+COPY . .
+
+# Default command: run unit tests with verbose output, race detection, and coverage
+CMD ["go", "test", "-v", "-race", "-cover", "-count=1", "./..."]

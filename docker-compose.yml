@@ -1,8 +1,123 @@
-version: '3.8'
+# docker-compose.yml — Full testing and build stack for xk6-amqp-modern
+#
+# Services:
+#   rabbitmq           — RabbitMQ server with Management Plugin (UI at :15672)
+#   k6-build           — Builds the custom k6 binary with the AMQP extension
+#   unit-tests         — Runs Go unit tests (no external dependencies)
+#   integration-tests  — Runs Go integration tests (needs RabbitMQ)
+#   k6-integration     — Runs k6 scripts against RabbitMQ
+#   k6-performance     — Runs multi-VU performance test (for manual use)
+#
+# Usage:
+#   # Start RabbitMQ only
+#   docker compose up -d rabbitmq
+#
+#   # Run unit tests
+#   docker compose run --rm unit-tests
+#
+#   # Run integration tests (starts RabbitMQ automatically)
+#   docker compose run --rm integration-tests
+#
+#   # Run k6 integration script
+#   docker compose run --rm k6-integration
+#
+#   # Run everything
+#   docker compose up --build --abort-on-container-exit unit-tests
+#   docker compose run --rm integration-tests
+#   docker compose run --rm k6-integration
+#
+#   # Performance testing (manual)
+#   docker compose run --rm k6-performance
 
 services:
+  # --- RabbitMQ Server ---
+  # Provides the AMQP broker for integration testing.
+  # Management UI available at http://localhost:15672 (guest/guest)
   rabbitmq:
     image: rabbitmq:3-management
     ports:
-      - "5672:5672"
-      - "15672:15672"
+      - "5672:5672"    # AMQP protocol
+      - "15672:15672"  # Management UI
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 15s
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    environment:
+      - RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS=+P 1048576
+
+  # --- Build k6 with Extension ---
+  # Compiles the custom k6 binary with the AMQP extension included.
+  k6-build:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: k6-amqp:local
+
+  # --- Unit Tests ---
+  # Runs Go unit tests that do NOT require RabbitMQ.
+  # These test module creation, option defaults, error handling, etc.
+  unit-tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    command: >
+      go test -v -race -cover -count=1
+      -coverprofile=/tmp/coverage.out
+      ./...
+    # Note: unit tests don't need RabbitMQ
+
+  # --- Integration Tests (Go) ---
+  # Runs Go integration tests that require a running RabbitMQ server.
+  # Uses build tag "integration" to select the right test files.
+  integration-tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    command: >
+      go test -v -race -count=1
+      -tags=integration
+      -timeout=120s
+      ./integration/...
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      - AMQP_URL=amqp://guest:guest@rabbitmq:5672/
+
+  # --- k6 Integration Test (Publish/Listen) ---
+  # Runs the k6 integration test script that validates the JS API.
+  k6-integration:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["run", "--no-usage-report", "/scripts/test_publish_listen.js"]
+    volumes:
+      - ./integration/scripts:/scripts
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      - AMQP_URL=amqp://guest:guest@rabbitmq:5672/
+
+  # --- k6 Performance Test (Manual) ---
+  # For your manual functional and performance testing.
+  # Override VUs and duration via command line:
+  #   docker compose run --rm k6-performance run /scripts/test_multi_vu.js --vus 10 --duration 30s
+  k6-performance:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["run", "--no-usage-report", "/scripts/test_multi_vu.js"]
+    volumes:
+      - ./integration/scripts:/scripts
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      - AMQP_URL=amqp://guest:guest@rabbitmq:5672/
